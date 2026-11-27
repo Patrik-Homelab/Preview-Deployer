@@ -92,9 +92,45 @@ preflight() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Interactive Configuration
+# 2. Interactive Configuration (with saved config & --update support)
 # ---------------------------------------------------------------------------
+UPDATE_MODE="false"
+SAVED_CONFIG="/etc/preview-deployer/config.env"
+
+load_saved_config() {
+    if [[ -f "$SAVED_CONFIG" ]]; then
+        # shellcheck source=/dev/null
+        source "$SAVED_CONFIG"
+        NODE_MAJOR="${NODE_MAJOR:-22}"
+        PNPM_VERSION="${PNPM_VERSION:-10}"
+        NPM_PROXY_IP="${NPM_PROXY_IP:-}"
+        return 0
+    fi
+    return 1
+}
+
 collect_config() {
+    if [[ "$UPDATE_MODE" == "true" ]]; then
+        load_saved_config || die "Cannot use --update: ${SAVED_CONFIG} not found."
+        SETUP_RUNNER="n"
+        log_info "Updating using saved config (${SAVED_CONFIG})..."
+        return 0
+    fi
+
+    if load_saved_config; then
+        echo ""
+        log_info "Existing installation detected (${SAVED_CONFIG})."
+        local do_update=""
+        read -rp "Update scripts, systemd units, and Nginx using saved config (skip runner setup)? (y/n) [y]: " do_update
+        do_update="${do_update:-y}"
+        if [[ "${do_update,,}" == "y" || "${do_update,,}" == "yes" ]]; then
+            UPDATE_MODE="true"
+            SETUP_RUNNER="n"
+            return 0
+        fi
+        # Clear loaded vars only if user wants to re-prompt? Keep them as defaults!
+    fi
+
     echo ""
     echo "================================================================"
     echo "  Preview-Deployer — LXC Setup"
@@ -265,6 +301,9 @@ PREVIEW_DOMAIN="${PREVIEW_DOMAIN}"
 PORT_START=${PORT_START}
 PORT_END=${PORT_END}
 PREVIEW_TTL_DAYS=${PREVIEW_TTL_DAYS}
+NODE_MAJOR="${NODE_MAJOR}"
+PNPM_VERSION="${PNPM_VERSION}"
+NPM_PROXY_IP="${NPM_PROXY_IP}"
 PNPM_STORE_DIR="/var/cache/pnpm-store"
 PREVIEWS_ROOT="/opt/previews"
 STATE_DIR="/var/lib/preview-deployer"
@@ -429,12 +468,28 @@ setup_github_runner() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --update|-u) UPDATE_MODE="true" ;;
+            -h|--help)
+                echo "Usage: sudo ./setup.sh [--update]"
+                exit 0
+                ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+        shift
+    done
+
     preflight
     collect_config
-    install_packages
+    if [[ "$UPDATE_MODE" != "true" ]]; then
+        install_packages
+    fi
     setup_users_and_dirs
     write_config
-    setup_mariadb
+    if [[ "$UPDATE_MODE" != "true" ]]; then
+        setup_mariadb
+    fi
     setup_nginx
     install_control_plane
     setup_github_runner

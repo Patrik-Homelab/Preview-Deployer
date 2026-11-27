@@ -64,6 +64,16 @@ Bootstrap scripts and lifecycle tooling to turn a Debian 12/13+ LXC into an isol
    - Comment `!deploy --fresh` to wipe the PR's database and re-seed from scratch.
    - Comment `!teardown` (or close/merge the PR) to destroy the preview.
 
+## Updating an Existing LXC
+
+To update `preview-ctl`, `systemd` units, and `nginx` templates/404 page without re-registering the GitHub runner:
+
+```bash
+cd Preview-Deployer
+git pull
+sudo ./setup.sh --update
+```
+
 ## `preview-ctl` Commands
 
 ```bash
