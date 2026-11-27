@@ -1,0 +1,10 @@
+[Unit]
+Description=Reap stale PR preview deployments
+After=network.target mariadb.service nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/preview-ctl reap
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=preview-reaper

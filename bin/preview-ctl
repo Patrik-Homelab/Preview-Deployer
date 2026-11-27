@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# preview-ctl — Lifecycle manager for isolated PR preview deployments.
+# Installed to /usr/local/bin/preview-ctl and invoked as root (or via allowlisted sudo).
+
+# Security: Ignore test/override env vars when running as root or via sudo.
+if [[ "${EUID}" -eq 0 || -n "${SUDO_USER:-}" ]]; then
+    CONFIG_FILE="/etc/preview-deployer/config.env"
+    TEST_MODE="0"
+else
+    CONFIG_FILE="${PREVIEW_CONFIG_FILE:-/etc/preview-deployer/config.env}"
+    TEST_MODE="${PREVIEW_TEST_MODE:-0}"
+fi
+
+# ---------------------------------------------------------------------------
+# Logging & Helpers
+# ---------------------------------------------------------------------------
+log_info()  { printf '[preview-ctl] %s\n' "$*"; }
+log_warn()  { printf '[preview-ctl] WARN: %s\n' "$*" >&2; }
+log_error() { printf '[preview-ctl] ERROR: %s\n' "$*" >&2; }
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  preview-ctl deploy <app> <pr> <source-dir> [--fresh]
+  preview-ctl destroy <app> <pr>
+  preview-ctl list
+  preview-ctl status <app> <pr>
+  preview-ctl reap [days]
+  preview-ctl add-app <app>
+EOF
+}
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || die "Config file not found: $CONFIG_FILE"
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    : "${PREVIEW_DOMAIN:?Missing PREVIEW_DOMAIN}"
+    : "${PORT_START:?Missing PORT_START}"
+    : "${PORT_END:?Missing PORT_END}"
+    : "${PREVIEW_TTL_DAYS:=14}"
+    : "${PNPM_STORE_DIR:=/var/cache/pnpm-store}"
+    : "${PREVIEWS_ROOT:=/opt/previews}"
+    : "${STATE_DIR:=/var/lib/preview-deployer}"
+    : "${APPS_DIR:=/etc/preview-deployer/apps}"
+    : "${HTPASSWD_DIR:=/etc/preview-deployer/htpasswd}"
+    : "${NGINX_PREVIEWS_DIR:=/etc/nginx/previews}"
+    : "${PREVIEW_USER:=preview}"
+    : "${RUNNER_HOME:=/home/gh-runner}"
+}
+
+validate_app_name() {
+    local app="$1"
+    [[ "$app" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "Invalid app name '$app' (allowed: [a-z0-9-], max 32 chars)."
+}
+
+validate_pr_number() {
+    local pr="$1"
+    [[ "$pr" =~ ^[0-9]{1,6}$ ]] && (( 10#$pr > 0 )) || die "Invalid PR number '$pr' (must be positive integer)."
+}
+
+load_app_config() {
+    local app="$1"
+    local app_conf="${APPS_DIR}/${app}.conf"
+    local app_env_tmpl="${APPS_DIR}/${app}.env.tmpl"
+    [[ -f "$app_conf" ]] || die "App '${app}' is not registered (missing ${app_conf})."
+    [[ -f "$app_env_tmpl" ]] || die "Missing env template for '${app}': ${app_env_tmpl}."
+
+    # Defaults
+    MIGRATE_CMD=""
+    SEED_CMD=""
+    BASIC_AUTH="false"
+    PRESERVE_PATHS="uploads/ storage/ logs/"
+    HEALTH_PATH="/"
+
+    # shellcheck source=/dev/null
+    source "$app_conf"
+}
+
+instance_name() {
+    local app="$1"
+    local pr="$2"
+    printf '%s-pr-%s' "$app" "$((10#$pr))"
+}
+
+preview_hostname() {
+    local app="$1"
+    local pr="$2"
+    printf 'preview-%s-pr-%s.%s' "$app" "$((10#$pr))" "$PREVIEW_DOMAIN"
+}
+
+db_name_for() {
+    local app="$1"
+    local pr="$2"
+    printf 'preview_%s_%s' "${app//-/_}" "$((10#$pr))"
+}
+
+db_user_for() {
+    local app="$1"
+    local pr="$2"
+    local clean="${app//-/_}"
+    printf 'pv_%s_%s' "${clean:0:16}" "$((10#$pr))"
+}
+
+random_hex() {
+    local bytes="${1:-24}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$bytes"
+    else
+        od -An -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Locking & State Helpers
+# ---------------------------------------------------------------------------
+acquire_lock() {
+    mkdir -p "$STATE_DIR"
+    exec 9>"${STATE_DIR}/state.lock"
+    flock -w 60 9 || die "Timed out waiting for state lock."
+}
+
+port_in_use_os() {
+    local port="$1"
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return 1
+    fi
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "(:|\\])${port}\$"
+}
+
+allocate_port() {
+    local instance="$1"
+    local ports_file="${STATE_DIR}/ports.json"
+    [[ -f "$ports_file" ]] || echo '{}' > "$ports_file"
+
+    local existing
+    existing="$(jq -r --arg inst "$instance" '.[$inst] // empty' "$ports_file")"
+    if [[ -n "$existing" ]]; then
+        printf '%s' "$existing"
+        return 0
+    fi
+
+    local p
+    for (( p = PORT_START; p <= PORT_END; p++ )); do
+        if jq -e --argjson p "$p" 'to_entries | any(.value == $p)' "$ports_file" >/dev/null 2>&1; then
+            continue
+        fi
+        if port_in_use_os "$p"; then
+            continue
+        fi
+        local tmp
+        tmp="$(mktemp "${STATE_DIR}/ports.json.XXXXXX")"
+        jq --arg inst "$instance" --argjson p "$p" '.[$inst] = $p' "$ports_file" > "$tmp"
+        mv "$tmp" "$ports_file"
+        chmod 0640 "$ports_file"
+        printf '%s' "$p"
+        return 0
+    done
+
+    die "No free ports available in range ${PORT_START}-${PORT_END}."
+}
+
+release_port() {
+    local instance="$1"
+    local ports_file="${STATE_DIR}/ports.json"
+    [[ -f "$ports_file" ]] || return 0
+    local tmp
+    tmp="$(mktemp "${STATE_DIR}/ports.json.XXXXXX")"
+    jq --arg inst "$instance" 'del(.[$inst])' "$ports_file" > "$tmp"
+    mv "$tmp" "$ports_file"
+    chmod 0640 "$ports_file"
+}
+
+record_deployment() {
+    local instance="$1"
+    local app="$2"
+    local pr="$3"
+    local port="$4"
+    local hostname="$5"
+    local db_name="$6"
+    local db_user="$7"
+    local dep_file="${STATE_DIR}/deployments.json"
+    [[ -f "$dep_file" ]] || echo '{}' > "$dep_file"
+
+    local now_ts
+    now_ts="$(date -u +%s)"
+    local tmp
+    tmp="$(mktemp "${STATE_DIR}/deployments.json.XXXXXX")"
+    jq \
+        --arg inst "$instance" \
+        --arg app "$app" \
+        --arg pr "$((10#$pr))" \
+        --argjson port "$port" \
+        --arg host "$hostname" \
+        --arg db "$db_name" \
+        --arg user "$db_user" \
+        --argjson updated "$now_ts" \
+        '.[$inst] = {
+            app: $app,
+            pr: ($pr | tonumber),
+            port: $port,
+            hostname: $host,
+            db_name: $db,
+            db_user: $user,
+            updated_at: $updated
+        }' "$dep_file" > "$tmp"
+    mv "$tmp" "$dep_file"
+    chmod 0640 "$dep_file"
+}
+
+remove_deployment_record() {
+    local instance="$1"
+    local dep_file="${STATE_DIR}/deployments.json"
+    [[ -f "$dep_file" ]] || return 0
+    local tmp
+    tmp="$(mktemp "${STATE_DIR}/deployments.json.XXXXXX")"
+    jq --arg inst "$instance" 'del(.[$inst])' "$dep_file" > "$tmp"
+    mv "$tmp" "$dep_file"
+    chmod 0640 "$dep_file"
+}
+
+# ---------------------------------------------------------------------------
+# Template Rendering
+# ---------------------------------------------------------------------------
+render_env_file() {
+    local tmpl_path="$1"
+    local out_path="$2"
+    local port="$3"
+    local hostname="$4"
+    local db_name="$5"
+    local db_user="$6"
+    local db_pass="$7"
+    local app_secret="$8"
+
+    local origin="https://${hostname}"
+    local db_url="mysql://${db_user}:${db_pass}@127.0.0.1:3306/${db_name}"
+
+    local content
+    content="$(<"$tmpl_path")"
+    content="${content//\{\{PORT\}\}/$port}"
+    content="${content//\{\{HOSTNAME\}\}/$hostname}"
+    content="${content//\{\{ORIGIN\}\}/$origin}"
+    content="${content//\{\{DB_HOST\}\}/127.0.0.1}"
+    content="${content//\{\{DB_PORT\}\}/3306}"
+    content="${content//\{\{DB_NAME\}\}/$db_name}"
+    content="${content//\{\{DB_USER\}\}/$db_user}"
+    content="${content//\{\{DB_PASS\}\}/$db_pass}"
+    content="${content//\{\{DB_URL\}\}/$db_url}"
+    content="${content//\{\{APP_SECRET\}\}/$app_secret}"
+
+    printf '%s\n' "$content" > "$out_path"
+    chmod 0600 "$out_path"
+    if [[ "$TEST_MODE" != "1" ]]; then
+        chown "${PREVIEW_USER}:${PREVIEW_USER}" "$out_path"
+    fi
+}
+
+render_nginx_site() {
+    local app="$1"
+    local instance="$2"
+    local hostname="$3"
+    local port="$4"
+
+    local tmpl="${NGINX_SITE_TMPL:-/etc/preview-deployer/preview-site.conf.tmpl}"
+    [[ -f "$tmpl" ]] || die "Missing Nginx site template: $tmpl"
+
+    local auth_block=""
+    if [[ "${BASIC_AUTH}" == "true" ]]; then
+        local htpasswd_file="${HTPASSWD_DIR}/${app}.htpasswd"
+        [[ -f "$htpasswd_file" ]] || die "BASIC_AUTH=true for '${app}' but missing ${htpasswd_file}"
+        auth_block="    auth_basic \"Preview (${app})\";
+    auth_basic_user_file ${htpasswd_file};"
+    fi
+
+    local content
+    content="$(<"$tmpl")"
+    content="${content//\{\{HOSTNAME\}\}/$hostname}"
+    content="${content//\{\{PORT\}\}/$port}"
+    content="${content//\{\{AUTH_BLOCK\}\}/$auth_block}"
+
+    local out_file="${NGINX_PREVIEWS_DIR}/${instance}.conf"
+    local backup_file=""
+    if [[ -f "$out_file" ]]; then
+        backup_file="$(mktemp)"
+        cp "$out_file" "$backup_file"
+    fi
+
+    printf '%s\n' "$content" > "$out_file"
+    chmod 0644 "$out_file"
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        if ! nginx -t >/dev/null 2>&1; then
+            if [[ -n "$backup_file" ]]; then
+                mv "$backup_file" "$out_file"
+            else
+                rm -f "$out_file"
+            fi
+            die "nginx -t failed after rendering ${out_file}; rolled back."
+        fi
+        rm -f "$backup_file"
+        systemctl reload nginx
+    else
+        rm -f "$backup_file"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Database & Execution Helpers
+# ---------------------------------------------------------------------------
+ensure_database() {
+    local db_name="$1"
+    local db_user="$2"
+    local db_pass="$3"
+    local fresh="$4"
+
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return 0
+    fi
+
+    if [[ "$fresh" == "true" ]]; then
+        mariadb -e "DROP DATABASE IF EXISTS \`${db_name}\`;"
+    fi
+
+    mariadb -e "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mariadb -e "CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';"
+    mariadb -e "ALTER USER '${db_user}'@'127.0.0.1' IDENTIFIED BY '${db_pass}';"
+    mariadb -e "GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1';"
+    mariadb -e "FLUSH PRIVILEGES;"
+}
+
+drop_database() {
+    local db_name="$1"
+    local db_user="$2"
+
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return 0
+    fi
+
+    mariadb -e "DROP DATABASE IF EXISTS \`${db_name}\`;"
+    mariadb -e "DROP USER IF EXISTS '${db_user}'@'127.0.0.1';"
+    mariadb -e "FLUSH PRIVILEGES;"
+}
+
+run_as_preview() {
+    local workdir="$1"
+    local cmd="$2"
+
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return 0
+    fi
+
+    su -s /bin/bash "$PREVIEW_USER" -c "
+        set -euo pipefail
+        cd '${workdir}'
+        export npm_config_store_dir='${PNPM_STORE_DIR}'
+        export PNPM_STORE_DIR='${PNPM_STORE_DIR}'
+        if [[ -f .env ]]; then
+            set -a
+            source .env
+            set +a
+        fi
+        ${cmd}
+    "
+}
+
+wait_for_health() {
+    local port="$1"
+    local path="$2"
+    if [[ "$TEST_MODE" == "1" ]]; then
+        return 0
+    fi
+
+    local i
+    for (( i = 1; i <= 30; i++ )); do
+        if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${port}${path}" 2>/dev/null; then
+            return 0
+        fi
+        # Even a 302/401/404 means the Node server is listening and responding
+        local code
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${port}${path}" 2>/dev/null || echo "000")"
+        if [[ "$code" != "000" ]]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    log_warn "Service did not respond on 127.0.0.1:${port}${path} within 15s (check: journalctl -u preview@*)."
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+cmd_deploy() {
+    local app="${1:-}"
+    local pr="${2:-}"
+    local src_dir="${3:-}"
+    local fresh="false"
+    shift 3 || { usage; exit 1; }
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fresh) fresh="true" ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    validate_app_name "$app"
+    validate_pr_number "$pr"
+    load_app_config "$app"
+
+    [[ -n "$src_dir" && -d "$src_dir" ]] || die "Source directory does not exist: ${src_dir}"
+    src_dir="$(realpath "$src_dir")"
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        case "$src_dir" in
+            "${RUNNER_HOME}"/*|/tmp/*) ;;
+            *) die "Source directory must reside inside ${RUNNER_HOME} or /tmp: ${src_dir}" ;;
+        esac
+    fi
+
+    local instance hostname db_name db_user target_dir cred_file
+    instance="$(instance_name "$app" "$pr")"
+    hostname="$(preview_hostname "$app" "$pr")"
+    db_name="$(db_name_for "$app" "$pr")"
+    db_user="$(db_user_for "$app" "$pr")"
+    target_dir="${PREVIEWS_ROOT}/${instance}"
+    cred_file="${STATE_DIR}/${instance}.creds"
+
+    acquire_lock
+
+    local is_first_deploy="true"
+    if [[ -d "$target_dir" && "$fresh" != "true" ]]; then
+        is_first_deploy="false"
+    fi
+
+    local port
+    port="$(allocate_port "$instance")"
+
+    local db_pass app_secret
+    if [[ -f "$cred_file" && "$fresh" != "true" ]]; then
+        # shellcheck source=/dev/null
+        source "$cred_file"
+    else
+        db_pass="$(random_hex 16)"
+        app_secret="$(random_hex 32)"
+        cat > "$cred_file" <<EOF
+db_pass="${db_pass}"
+app_secret="${app_secret}"
+EOF
+        chmod 0600 "$cred_file"
+    fi
+
+    log_info "Deploying ${instance} -> https://${hostname} (127.0.0.1:${port})"
+
+    ensure_database "$db_name" "$db_user" "$db_pass" "$fresh"
+
+    if [[ "$fresh" == "true" && -d "$target_dir" ]]; then
+        if [[ "$TEST_MODE" != "1" ]]; then
+            systemctl stop "preview@${instance}.service" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$target_dir"
+    fi
+
+    mkdir -p "$target_dir"
+    local rsync_excludes=(--exclude ".git" --exclude "node_modules" --exclude ".env")
+    for p in $PRESERVE_PATHS; do
+        rsync_excludes+=(--exclude "$p")
+    done
+    rsync -a --delete "${rsync_excludes[@]}" "${src_dir}/" "${target_dir}/"
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        chown -R "${PREVIEW_USER}:${PREVIEW_USER}" "$target_dir"
+    fi
+
+    render_env_file "${APPS_DIR}/${app}.env.tmpl" "${target_dir}/.env" \
+        "$port" "$hostname" "$db_name" "$db_user" "$db_pass" "$app_secret"
+
+    if [[ -f "${target_dir}/package.json" ]]; then
+        log_info "Installing dependencies with pnpm..."
+        run_as_preview "$target_dir" "pnpm install --frozen-lockfile"
+    fi
+
+    if [[ -n "$MIGRATE_CMD" ]]; then
+        log_info "Running migrations: ${MIGRATE_CMD}"
+        run_as_preview "$target_dir" "$MIGRATE_CMD"
+    fi
+
+    if [[ "$is_first_deploy" == "true" && -n "$SEED_CMD" ]]; then
+        log_info "Running initial preview seed: ${SEED_CMD}"
+        run_as_preview "$target_dir" "$SEED_CMD"
+    fi
+
+    render_nginx_site "$app" "$instance" "$hostname" "$port"
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        systemctl restart "preview@${instance}.service"
+    fi
+
+    wait_for_health "$port" "$HEALTH_PATH"
+    record_deployment "$instance" "$app" "$pr" "$port" "$hostname" "$db_name" "$db_user"
+
+    log_info "Deployed successfully."
+    printf 'PREVIEW_URL=https://%s\n' "$hostname"
+    printf 'PREVIEW_PORT=%s\n' "$port"
+}
+
+cmd_destroy() {
+    local app="${1:-}"
+    local pr="${2:-}"
+    [[ -n "$app" && -n "$pr" ]] || { usage; exit 1; }
+
+    validate_app_name "$app"
+    validate_pr_number "$pr"
+
+    local instance db_name db_user target_dir nginx_conf cred_file
+    instance="$(instance_name "$app" "$pr")"
+    db_name="$(db_name_for "$app" "$pr")"
+    db_user="$(db_user_for "$app" "$pr")"
+    target_dir="${PREVIEWS_ROOT}/${instance}"
+    nginx_conf="${NGINX_PREVIEWS_DIR}/${instance}.conf"
+    cred_file="${STATE_DIR}/${instance}.creds"
+
+    acquire_lock
+
+    log_info "Destroying ${instance}..."
+
+    if [[ "$TEST_MODE" != "1" ]]; then
+        systemctl stop "preview@${instance}.service" >/dev/null 2>&1 || true
+        systemctl disable "preview@${instance}.service" >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f "$nginx_conf" ]]; then
+        rm -f "$nginx_conf"
+        if [[ "$TEST_MODE" != "1" ]]; then
+            nginx -t >/dev/null 2>&1 && systemctl reload nginx || log_warn "Nginx reload failed during destroy."
+        fi
+    fi
+
+    drop_database "$db_name" "$db_user"
+    rm -rf "$target_dir" "$cred_file"
+    release_port "$instance"
+    remove_deployment_record "$instance"
+
+    log_info "Destroyed ${instance}."
+}
+
+cmd_list() {
+    local dep_file="${STATE_DIR}/deployments.json"
+    if [[ ! -f "$dep_file" ]] || [[ "$(jq 'length' "$dep_file")" -eq 0 ]]; then
+        echo "No active preview deployments."
+        return 0
+    fi
+
+    printf '%-24s %-6s %-42s %-10s %s\n' "INSTANCE" "PORT" "URL" "STATUS" "UPDATED"
+    printf '%-24s %-6s %-42s %-10s %s\n' "--------" "----" "---" "------" "-------"
+
+    jq -r 'to_entries[] | [.key, (.value.port|tostring), .value.hostname, (.value.updated_at|tostring)] | @tsv' "$dep_file" \
+    | while IFS=$'\t' read -r inst port host updated_ts; do
+        local st="mock"
+        if [[ "$TEST_MODE" != "1" ]]; then
+            st="$(systemctl is-active "preview@${inst}.service" 2>/dev/null || echo "inactive")"
+        fi
+        local updated_str
+        updated_str="$(date -u -d "@${updated_ts}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$updated_ts")"
+        printf '%-24s %-6s https://%-34s %-10s %s\n' "$inst" "$port" "$host" "$st" "$updated_str"
+    done
+}
+
+cmd_status() {
+    local app="${1:-}"
+    local pr="${2:-}"
+    [[ -n "$app" && -n "$pr" ]] || { usage; exit 1; }
+    validate_app_name "$app"
+    validate_pr_number "$pr"
+
+    local instance dep_file
+    instance="$(instance_name "$app" "$pr")"
+    dep_file="${STATE_DIR}/deployments.json"
+
+    if [[ ! -f "$dep_file" ]] || ! jq -e --arg inst "$instance" 'has($inst)' "$dep_file" >/dev/null 2>&1; then
+        die "Preview '${instance}' is not deployed."
+    fi
+
+    jq --arg inst "$instance" '.[$inst]' "$dep_file"
+    if [[ "$TEST_MODE" != "1" ]]; then
+        systemctl status "preview@${instance}.service" --no-pager -n 10 || true
+    fi
+}
+
+cmd_reap() {
+    local ttl_days="${1:-$PREVIEW_TTL_DAYS}"
+    [[ "$ttl_days" =~ ^[0-9]+$ ]] || die "TTL days must be an integer."
+
+    local dep_file="${STATE_DIR}/deployments.json"
+    [[ -f "$dep_file" ]] || return 0
+
+    local now_ts cutoff_ts
+    now_ts="$(date -u +%s)"
+    cutoff_ts=$(( now_ts - ttl_days * 86400 ))
+
+    local expired
+    expired="$(jq -r --argjson cutoff "$cutoff_ts" \
+        'to_entries[] | select(.value.updated_at < $cutoff) | "\(.value.app)\t\(.value.pr)"' "$dep_file")"
+
+    if [[ -z "$expired" ]]; then
+        log_info "No stale previews older than ${ttl_days} days."
+        return 0
+    fi
+
+    while IFS=$'\t' read -r app pr; do
+        log_info "Reaping stale preview: ${app} PR #${pr}"
+        cmd_destroy "$app" "$pr"
+    done <<< "$expired"
+}
+
+cmd_add_app() {
+    local app="${1:-}"
+    [[ -n "$app" ]] || { usage; exit 1; }
+    validate_app_name "$app"
+
+    local migrate_cmd seed_cmd enable_auth auth_user auth_pass
+    read -rp "Migration command (e.g. 'pnpm run migrate', blank to skip): " migrate_cmd
+    read -rp "Initial seed command (e.g. 'pnpm run preview:seed', blank to skip): " seed_cmd
+    read -rp "Enable HTTP Basic Auth for this app? (y/n) [n]: " enable_auth
+    enable_auth="${enable_auth:-n}"
+
+    local basic_auth_val="false"
+    if [[ "${enable_auth,,}" == "y" || "${enable_auth,,}" == "yes" ]]; then
+        basic_auth_val="true"
+        read -rp "Basic Auth username [preview]: " auth_user
+        auth_user="${auth_user:-preview}"
+        read -rsp "Basic Auth password: " auth_pass
+        echo ""
+        [[ -n "$auth_pass" ]] || die "Password cannot be empty."
+        htpasswd -bcB "${HTPASSWD_DIR}/${app}.htpasswd" "$auth_user" "$auth_pass"
+        chown root:www-data "${HTPASSWD_DIR}/${app}.htpasswd"
+        chmod 0640 "${HTPASSWD_DIR}/${app}.htpasswd"
+    fi
+
+    cat > "${APPS_DIR}/${app}.conf" <<EOF
+MIGRATE_CMD="${migrate_cmd}"
+SEED_CMD="${seed_cmd}"
+BASIC_AUTH="${basic_auth_val}"
+PRESERVE_PATHS="uploads/ storage/ logs/"
+HEALTH_PATH="/"
+EOF
+    chmod 0640 "${APPS_DIR}/${app}.conf"
+
+    if [[ ! -f "${APPS_DIR}/${app}.env.tmpl" ]]; then
+        cat > "${APPS_DIR}/${app}.env.tmpl" <<'EOF'
+HOST=127.0.0.1
+PORT={{PORT}}
+ORIGIN={{ORIGIN}}
+DATABASE_URL={{DB_URL}}
+EOF
+        chmod 0640 "${APPS_DIR}/${app}.env.tmpl"
+        log_info "Created starter ${APPS_DIR}/${app}.env.tmpl — customize it with your app's env vars."
+    fi
+
+    log_info "Registered app '${app}' at ${APPS_DIR}/${app}.conf"
+}
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+main() {
+    local cmd="${1:-}"
+    if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+    shift
+
+    load_config
+
+    case "$cmd" in
+        deploy)  cmd_deploy "$@" ;;
+        destroy) cmd_destroy "$@" ;;
+        list)    cmd_list "$@" ;;
+        status)  cmd_status "$@" ;;
+        reap)    cmd_reap "$@" ;;
+        add-app) cmd_add_app "$@" ;;
+        *)       usage; exit 1 ;;
+    esac
+}
+
+main "$@"

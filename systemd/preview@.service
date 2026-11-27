@@ -1,0 +1,37 @@
+[Unit]
+Description=PR Preview App (%i)
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=preview
+Group=preview
+WorkingDirectory=/opt/previews/%i
+EnvironmentFile=/opt/previews/%i/.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node -r dotenv/config build
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+# Sandboxing & resource limits
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/previews/%i
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=128
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=preview-%i
+
+[Install]
+WantedBy=multi-user.target

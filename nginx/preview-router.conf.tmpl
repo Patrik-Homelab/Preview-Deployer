@@ -1,0 +1,20 @@
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+{{REAL_IP_BLOCK}}
+
+    root /var/www/preview-404;
+
+    location / {
+        try_files /index.html =404;
+    }
+
+    error_page 404 /index.html;
+    location = /index.html {
+        internal;
+    }
+}
+
+include /etc/nginx/previews/*.conf;
