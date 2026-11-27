@@ -391,7 +391,7 @@ setup_github_runner() {
     install -d -m 0750 -o gh-runner -g gh-runner "$runner_dir"
     local tarball_tmp
     tarball_tmp="$(mktemp /tmp/actions-runner.XXXXXX.tar.gz)"
-    trap 'rm -f "$tarball_tmp"' RETURN
+    trap 'rm -f "${tarball_tmp:-}"' RETURN
 
     log_info "Downloading GitHub Actions runner..."
     curl -fsSL -o "$tarball_tmp" "$RUNNER_TARBALL_URL"
